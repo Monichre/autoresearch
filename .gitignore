@@ -21,3 +21,7 @@ dev/
 
 # Results file
 results.tsv
+
+# Modal cache and logs
+.modal/
+modal_logs/
