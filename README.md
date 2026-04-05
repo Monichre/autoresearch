@@ -39,6 +39,24 @@ uv run train.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
+### Alternative: Run on Modal (Cloud GPU)
+
+Don't have a local GPU? Run autoresearch on [Modal](https://modal.com) with H100/A100 GPUs:
+
+```bash
+# Install Modal
+pip install modal
+modal setup
+
+# One-time setup (download data, train tokenizer)
+modal run modal_runner.py::setup
+
+# Run experiments on Modal's GPUs
+modal run modal_agent_loop.py --run-tag apr5
+```
+
+See **[MODAL_QUICKSTART.md](MODAL_QUICKSTART.md)** for complete Modal setup guide.
+
 ## Running the agent
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
