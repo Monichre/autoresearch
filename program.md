@@ -18,25 +18,143 @@ To set up a new experiment, work with the user to:
 
 Once you get confirmation, kick off the experimentation.
 
+---
+
+## Research policy
+
+### Objective
+
+Find changes to `train.py` that reduce `val_bpb` on the fixed 5-minute training budget.
+The search runs in phases. Complete each phase before moving to the next.
+An agent on an H100 has no meaningful VRAM constraint — optimize purely for quality.
+
+### Primary metric
+`val_bpb` — lower is better. This is the only metric that determines keep vs. discard.
+
+### Secondary metrics (tiebreakers only)
+- `peak_vram_mb` — relevant only to flag regressions, not a constraint
+- `mfu_percent` — useful signal: low MFU means the GPU is underutilized, not that the config is bad
+- `num_params_M` — prefer smaller models at equal `val_bpb`
+- Code simplicity — equal `val_bpb` with fewer lines is a keep
+
+### Acceptance policy
+- **Keep** if `val_bpb` drops by any amount, however small.
+- **Keep tiny gains** (< 0.001) only if code is simpler or params are fewer.
+- **Discard** anything that does not improve `val_bpb`.
+- **Crash** = OOM, Python exception, or `val_bpb` > 100 / NaN. Attempt a fix once. If it fails again, log crash and move on.
+- **Never combine two untested ideas** until each has been individually validated as a keep.
+
+---
+
+## Search phases
+
+Work through these phases in order. Do not jump ahead.
+When a phase produces 3 consecutive discards with no new ideas, advance to the next phase.
+
+### Phase 1 — Throughput (start here)
+
+Goal: maximize tokens processed in 5 minutes without hurting `val_bpb`.
+More steps = more signal. Start here because throughput gains are free quality.
+
+Allowed knobs:
+- `DEVICE_BATCH_SIZE` — increase until MFU stops rising
+- `TOTAL_BATCH_SIZE` — increase in powers of 2 (keep it a multiple of `DEVICE_BATCH_SIZE * MAX_SEQ_LEN`)
+- `DEPTH` — try shallower models that fit more steps
+- `ASPECT_RATIO` / `HEAD_DIM` — try narrower models at same depth
+
+Use tag `[throughput]` in description.
+
+### Phase 2 — Optimizer
+
+Goal: improve convergence rate under the 5-minute budget.
+
+Allowed knobs:
+- `MATRIX_LR`, `EMBEDDING_LR`, `UNEMBEDDING_LR`, `SCALAR_LR`
+- `ADAM_BETAS`
+- `WEIGHT_DECAY`
+- `WARMUP_RATIO`, `WARMDOWN_RATIO`, `FINAL_LR_FRAC`
+- Muon `ns_steps`, `beta2`, momentum schedule in `get_muon_momentum()`
+
+Do not change architecture in this phase. One optimizer knob per experiment.
+Use tag `[optimizer]` in description.
+
+### Phase 3 — Architecture
+
+Goal: find structural changes that improve sample efficiency.
+
+Allowed knobs:
+- `WINDOW_PATTERN` — try `SSSSL`, `SL`, `SSLL`, `L` (all long), `S` (all short)
+- Value embedding coverage — try enabling or disabling VE on different layer indices (edit `has_ve()`)
+- `n_kv_head` — try grouped-query attention (set lower than `n_head`)
+- Activation function in `MLP.forward()` — try `F.gelu`, `F.silu` instead of `relu().square()`
+- Norm placement — try pre-norm vs. post-norm
+- Softcap value in `GPT.forward()` — try 10, 20, 30
+
+Forbidden in this phase: changing optimizer settings (keep Phase 2 winners fixed).
+Use tag `[arch]` in description.
+
+### Phase 4 — Combine winners
+
+Goal: stack the best individual changes from Phases 1-3.
+
+Rules:
+- Only combine changes that were individually validated as keeps.
+- Combine at most 2 changes per experiment.
+- If a combination is worse than either change alone, discard and do not retry that pair.
+
+Use tag `[combo]` in description.
+
+### Phase 5 — Free search
+
+Goal: explore ideas not covered above.
+
+Examples: custom LR schedules, mixed precision tweaks, alternative residual connections,
+label smoothing, gradient clipping, GC management changes.
+
+Use tag `[free]` in description.
+
+---
+
+## Forbidden edits (always)
+- Do not modify `prepare.py` — it contains the fixed evaluation harness.
+- Do not change `evaluate_bpb()`, `make_dataloader()`, `Tokenizer`, `MAX_SEQ_LEN`, or `TIME_BUDGET`.
+- Do not add new dependencies or imports beyond what is already in `pyproject.toml`.
+- Do not make compound edits: one change per experiment, always.
+
+---
+
+## Logging
+
+Use tab-separated descriptions so `results.tsv` is analyzable. Format:
+
+```
+[tag] short description of what changed
+```
+
+Examples:
+```
+[throughput] increase DEVICE_BATCH_SIZE 128->256
+[optimizer] MATRIX_LR 0.04->0.06
+[arch] WINDOW_PATTERN SSSL->SSSSL
+[combo] DEVICE_BATCH_SIZE 256 + MATRIX_LR 0.06
+[free] cosine LR schedule instead of linear warmdown
+```
+
+---
+
 ## Experimentation
 
 Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
-
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
-
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
-
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
-
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
-
 **The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas in the current phase, advance to the next phase. If you complete all phases, re-run Phase 5 with new ideas.
+
+**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure.
+
+**Crashes**: If a run crashes (OOM, or a bug), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+
+---
 
 ## Output format
 
@@ -55,11 +173,13 @@ num_params_M:     50.3
 depth:            8
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+You can extract the key metric from the log file:
 
 ```
 grep "^val_bpb:" run.log
 ```
+
+---
 
 ## Logging results
 
@@ -75,40 +195,24 @@ commit	val_bpb	memory_gb	status	description
 2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
 3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
 4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+5. short text description with tag: `[throughput] ...`, `[optimizer] ...`, etc.
 
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
+---
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The experiment runs on a dedicated branch (e.g. `autoresearch/apr5`).
 
 LOOP FOREVER:
 
 1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
-
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
-
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
-
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+2. Identify the current phase from `results.tsv` history
+3. Tune `train.py` with an experimental idea by directly hacking the code
+4. git commit
+5. Run the experiment: `uv run train.py > run.log 2>&1`
+6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix.
+8. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
+9. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
+10. If val_bpb is equal or worse, you git reset back to where you started
+11. Check phase advancement rules: 3 consecutive discards with no new ideas → next phase
