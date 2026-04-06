@@ -45,9 +45,14 @@ auth:
 	uv run modal token new
 
 secret:
-	@read -p "Paste your Anthropic API key (sk-ant-...): " key; \
-	uv run modal secret create anthropic ANTHROPIC_API_KEY=$$key
-	@echo "✓ Secret 'anthropic' created in Modal"
+	@read -p "Paste your Groq API key (gsk_...): " key; \
+	uv run modal secret create groq GROQ_API_KEY=$$key
+	@echo "✓ Secret 'groq' created in Modal"
+
+secret-google:
+	@read -p "Paste your Google AI Studio API key (AIza...): " key; \
+	uv run modal secret create google GOOGLE_API_KEY=$$key
+	@echo "✓ Secret 'google' created in Modal (Gemini primary provider)"
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 
